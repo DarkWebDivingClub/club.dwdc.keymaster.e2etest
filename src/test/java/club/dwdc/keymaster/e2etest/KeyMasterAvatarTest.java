@@ -54,6 +54,9 @@ class KeyMasterAvatarTest {
     @SuppressWarnings("resource")
     private static GenericContainer<?> avatar;
 
+    @SuppressWarnings("resource")
+    private static GenericContainer<?> sshd;
+
     private static String avatarPubKey;
 
     @BeforeAll
@@ -72,6 +75,25 @@ class KeyMasterAvatarTest {
                 .waitingFor(Wait.forListeningPort());
         relay.start();
         log.info("Relay started on port {}", relay.getMappedPort(7777));
+
+        // Build sshd target container with authorized_keys from test mnemonic
+        KeyMaster kmForKeys = new KeyMaster(TEST_MNEMONIC);
+        kmForKeys.createIdentity("alice@atlanta.com");
+        String authorizedKeys = kmForKeys.getSshAuthorizedKeysLine();
+        log.info("Authorized keys: {}", authorizedKeys);
+
+        ImageFromDockerfile sshdImage = new ImageFromDockerfile()
+                .withFileFromPath("Dockerfile", Path.of("docker/sshd/Dockerfile"))
+                .withFileFromString("authorized_keys", authorizedKeys + "\n");
+
+        sshd = new GenericContainer<>(sshdImage)
+                .withExposedPorts(22)
+                .withNetwork(network)
+                .withNetworkAliases("sshd-target")
+                .withLogConsumer(new Slf4jLogConsumer(log).withPrefix("sshd"))
+                .waitingFor(Wait.forListeningPort());
+        sshd.start();
+        log.info("SSHD container started on port {}", sshd.getMappedPort(22));
 
         // Build avatar image from Dockerfile + pre-built binaries + entrypoint
         ImageFromDockerfile avatarImage = new ImageFromDockerfile()
@@ -152,9 +174,51 @@ class KeyMasterAvatarTest {
         km.detach();
     }
 
+    @Test
+    void sshLoginToRemoteHost() throws Exception {
+        KeyMaster km = new KeyMaster(TEST_MNEMONIC);
+        km.createIdentity("alice@atlanta.com");
+
+        String relayUrl = "ws://" + relay.getHost() + ":" + relay.getMappedPort(7777);
+        AvatarDescriptor descriptor = new AvatarDescriptor(relayUrl, avatarPubKey, List.of("ssh"));
+
+        String sessionId = km.attach(descriptor);
+        assertNotNull(sessionId, "Session ID should not be null after attach");
+
+        // Wait for service.spawn + service channel establishment
+        Thread.sleep(3000);
+
+        // Verify key is available via ssh-add
+        var listResult = avatar.execInContainer("ssh-add", "-l");
+        log.info("ssh-add -l exit={}, stdout={}, stderr={}",
+                listResult.getExitCode(), listResult.getStdout(), listResult.getStderr());
+        assertEquals(0, listResult.getExitCode(),
+                "ssh-add -l should list keys. stderr: " + listResult.getStderr());
+
+        // SSH login to the sshd target container
+        var sshResult = avatar.execInContainer(
+                "ssh",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "BatchMode=yes",
+                "testuser@sshd-target",
+                "echo", "hello-from-keymaster");
+
+        log.info("ssh exit={}, stdout={}, stderr={}",
+                sshResult.getExitCode(), sshResult.getStdout(), sshResult.getStderr());
+
+        assertEquals(0, sshResult.getExitCode(),
+                "SSH login should succeed. stderr: " + sshResult.getStderr());
+        assertTrue(sshResult.getStdout().contains("hello-from-keymaster"),
+                "SSH command output should contain 'hello-from-keymaster'. stdout: " + sshResult.getStdout());
+
+        km.detach();
+    }
+
     @AfterAll
     static void tearDown() {
         if (avatar != null) avatar.stop();
+        if (sshd != null) sshd.stop();
         if (relay != null) relay.stop();
         if (network != null) network.close();
     }
