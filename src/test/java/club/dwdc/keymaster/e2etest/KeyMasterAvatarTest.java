@@ -42,6 +42,10 @@ class KeyMasterAvatarTest {
             "avatar.binary",
             "/home/rene/git/club.dwdc.keymaster.avatar/target/release/keymaster-avatar");
 
+    private static final String SSH_AVATAR_BINARY = System.getProperty(
+            "ssh.avatar.binary",
+            "/home/rene/git/club.dwdc.keymaster.avatar/target/release/ssh-service-avatar");
+
     private static Network network;
 
     @SuppressWarnings("resource")
@@ -69,18 +73,21 @@ class KeyMasterAvatarTest {
         relay.start();
         log.info("Relay started on port {}", relay.getMappedPort(7777));
 
-        // Build avatar image from Dockerfile + pre-built binary
+        // Build avatar image from Dockerfile + pre-built binaries + entrypoint
         ImageFromDockerfile avatarImage = new ImageFromDockerfile()
                 .withFileFromPath("Dockerfile", Path.of("docker/avatar/Dockerfile"))
-                .withFileFromPath("keymaster-avatar", Path.of(AVATAR_BINARY));
+                .withFileFromPath("keymaster-avatar", Path.of(AVATAR_BINARY))
+                .withFileFromPath("ssh-service-avatar", Path.of(SSH_AVATAR_BINARY))
+                .withFileFromPath("entrypoint.sh", Path.of("docker/avatar/entrypoint.sh"));
 
-        // Start avatar container
+        // Start avatar container (entrypoint starts both avatar + ssh-service-avatar)
         avatar = new GenericContainer<>(avatarImage)
                 .withCommand("--relay", "ws://relay:7777", "--log-level", "debug")
                 .withNetwork(network)
                 .dependsOn(relay)
+                .withEnv("SSH_AUTH_SOCK", "/tmp/keymaster-avatar-ssh-agent.sock")
                 .withLogConsumer(new Slf4jLogConsumer(log).withPrefix("avatar"))
-                .waitingFor(Wait.forLogMessage(".*Avatar pubkey:.*", 1));
+                .waitingFor(Wait.forLogMessage(".*SSH agent listening.*", 1));
         avatar.start();
         log.info("Avatar container started");
 
@@ -105,6 +112,42 @@ class KeyMasterAvatarTest {
 
         String sessionId = km.attach(avatar);
         assertNotNull(sessionId, "Session ID should not be null after attach");
+
+        km.detach();
+    }
+
+    @Test
+    void sshAgentSocketExists() throws Exception {
+        var result = avatar.execInContainer("test", "-S",
+                "/tmp/keymaster-avatar-ssh-agent.sock");
+        assertEquals(0, result.getExitCode(),
+                "SSH agent socket should exist. stderr: " + result.getStderr());
+    }
+
+    @Test
+    void sshAddReturnsWhenAttached() throws Exception {
+        KeyMaster km = new KeyMaster(TEST_MNEMONIC);
+        km.createIdentity("alice@atlanta.com");
+
+        String relayUrl = "ws://" + relay.getHost() + ":" + relay.getMappedPort(7777);
+        AvatarDescriptor descriptor = new AvatarDescriptor(relayUrl, avatarPubKey, List.of("ssh"));
+
+        String sessionId = km.attach(descriptor);
+        assertNotNull(sessionId, "Session ID should not be null after attach");
+
+        // Wait for service.spawn to be processed and service channel to be established
+        Thread.sleep(3000);
+
+        // Run ssh-add -l inside the avatar container
+        var result = avatar.execInContainer(
+                "ssh-add", "-l");
+
+        log.info("ssh-add exit code: {}, stdout: {}, stderr: {}",
+                result.getExitCode(), result.getStdout(), result.getStderr());
+
+        // Exit code 2 = agent unreachable, 1 = agent ok but no keys, 0 = keys listed
+        assertNotEquals(2, result.getExitCode(),
+                "ssh-add should reach the agent (exit code != 2). stderr: " + result.getStderr());
 
         km.detach();
     }
