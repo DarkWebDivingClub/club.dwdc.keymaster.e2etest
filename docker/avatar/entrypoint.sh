@@ -1,6 +1,11 @@
 #!/bin/bash
 set -e
 
+# Set up GNUPGHOME for GPG operations
+export GNUPGHOME=/tmp/gnupg-home
+mkdir -p "$GNUPGHOME"
+chmod 700 "$GNUPGHOME"
+
 # Start keymaster-avatar in background, forwarding all arguments
 keymaster-avatar "$@" &
 AVATAR_PID=$!
@@ -19,8 +24,8 @@ if [ ! -S /tmp/keymaster-avatar.sock ]; then
     exit 1
 fi
 
-# Start ssh-service-avatar in background
-ssh-service-avatar --log-level debug &
+# Start km-ssh-sa in background
+km-ssh-sa --log-level debug &
 SSH_PID=$!
 
 echo "Avatar PID=$AVATAR_PID, SSH service PID=$SSH_PID"
