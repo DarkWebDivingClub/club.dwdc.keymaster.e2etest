@@ -12,7 +12,6 @@ import org.testcontainers.containers.Network;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.images.builder.ImageFromDockerfile;
-import org.testcontainers.images.builder.Transferable;
 import org.testcontainers.utility.MountableFile;
 
 import java.nio.file.Path;
@@ -47,13 +46,13 @@ class KeyMasterAvatarTest {
             "ssh.avatar.binary",
             "/home/rene/git/club.dwdc.keymaster.avatar/target/release/km-ssh-sa");
 
-    private static final String PKCS11_LIBRARY = System.getProperty(
-            "pkcs11.library",
-            "/home/rene/git/club.dwdc.keymaster.avatar/target/release/libiz_pkcs11_gpg.so");
+    private static final String GPG_AVATAR_BINARY = System.getProperty(
+            "gpg.avatar.binary",
+            "/home/rene/git/club.dwdc.keymaster.avatar/target/release/km-gpg-sa");
 
-    private static final String SCDAEMON_BINARY = System.getProperty(
-            "scdaemon.binary",
-            "/home/rene/git/club.dwdc.keymaster.avatar/target/release/iz-scdaemon");
+    private static final String SCD_SHIM_BINARY = System.getProperty(
+            "scd.shim.binary",
+            "/home/rene/git/club.dwdc.keymaster.avatar/target/release/scd-shim");
 
     private static Network network;
 
@@ -104,25 +103,24 @@ class KeyMasterAvatarTest {
         sshd.start();
         log.info("SSHD container started on port {}", sshd.getMappedPort(22));
 
-        // Build avatar image from Dockerfile + pre-built binaries + scdaemon + entrypoint
+        // Build avatar image from Dockerfile + pre-built binaries + entrypoint
         ImageFromDockerfile avatarImage = new ImageFromDockerfile()
                 .withFileFromPath("Dockerfile", Path.of("docker/avatar/Dockerfile"))
                 .withFileFromPath("keymaster-avatar", Path.of(AVATAR_BINARY))
                 .withFileFromPath("km-ssh-sa", Path.of(SSH_AVATAR_BINARY))
-                .withFileFromPath("iz-scdaemon", Path.of(SCDAEMON_BINARY))
-                .withFileFromPath("libiz_pkcs11_gpg.so", Path.of(PKCS11_LIBRARY))
+                .withFileFromPath("km-gpg-sa", Path.of(GPG_AVATAR_BINARY))
+                .withFileFromPath("scd-shim", Path.of(SCD_SHIM_BINARY))
                 .withFileFromPath("entrypoint.sh", Path.of("docker/avatar/entrypoint.sh"));
 
-        // Start avatar container (entrypoint starts both avatar + km-ssh-sa)
+        // Start avatar container (entrypoint starts avatar, which spawns service avatars)
         avatar = new GenericContainer<>(avatarImage)
                 .withCommand("--relay", "ws://relay:7777", "--log-level", "debug")
                 .withNetwork(network)
                 .dependsOn(relay)
                 .withEnv("SSH_AUTH_SOCK", "/tmp/keymaster-avatar-ssh-agent.sock")
-                .withEnv("IZ_PKCS11_SOCKET", "/tmp/keymaster-avatar.sock")
                 .withEnv("GNUPGHOME", "/tmp/gnupg-home")
                 .withLogConsumer(new Slf4jLogConsumer(log).withPrefix("avatar"))
-                .waitingFor(Wait.forLogMessage(".*SSH agent listening.*", 1));
+                .waitingFor(Wait.forLogMessage(".*Local API listening.*", 1));
         avatar.start();
         log.info("Avatar container started");
 
@@ -170,8 +168,8 @@ class KeyMasterAvatarTest {
         String sessionId = km.attach(descriptor);
         assertNotNull(sessionId, "Session ID should not be null after attach");
 
-        // Channels are derived immediately from xpubs — no service.spawn delay needed
-        Thread.sleep(500);
+        // Wait for km-ssh-sa to be spawned and start its SSH agent
+        Thread.sleep(2000);
 
         // Run ssh-add -l inside the avatar container
         var result = avatar.execInContainer(
@@ -198,8 +196,8 @@ class KeyMasterAvatarTest {
         String sessionId = km.attach(descriptor);
         assertNotNull(sessionId, "Session ID should not be null after attach");
 
-        // Channels are derived immediately from xpubs — no service.spawn delay needed
-        Thread.sleep(500);
+        // Wait for km-ssh-sa to be spawned and start its SSH agent
+        Thread.sleep(2000);
 
         // Verify key is available via ssh-add
         var listResult = avatar.execInContainer("ssh-add", "-l");
@@ -230,34 +228,8 @@ class KeyMasterAvatarTest {
 
     @Test
     void gpgSignAndVerify() throws Exception {
-        // Configure gpg-agent to use iz-scdaemon (our custom scdaemon that speaks
-        // Assuan protocol and communicates with the avatar's local API directly,
-        // bypassing gnupg-pkcs11-scd which doesn't support Ed25519)
-        String gpgAgentConf =
-                "scdaemon-program /usr/local/bin/iz-scdaemon\n" +
-                "allow-loopback-pinentry\n" +
-                "pinentry-program /tmp/gnupg-home/pinentry-iz.sh\n" +
-                "log-file /tmp/gnupg-home/gpg-agent.log\n" +
-                "verbose\n";
-        avatar.copyFileToContainer(
-                Transferable.of(gpgAgentConf), "/tmp/gnupg-home/gpg-agent.conf");
-
-        // Write dummy pinentry that returns empty PIN
-        String pinentry =
-                "#!/bin/bash\n" +
-                "echo \"OK Pleased to meet you\"\n" +
-                "while IFS= read -r cmd; do\n" +
-                "  case \"${cmd%% *}\" in\n" +
-                "    GETPIN) echo \"D\"; echo \"OK\";;\n" +
-                "    BYE) echo \"OK\"; exit 0;;\n" +
-                "    *) echo \"OK\";;\n" +
-                "  esac\n" +
-                "done\n";
-        avatar.copyFileToContainer(
-                Transferable.of(pinentry), "/tmp/gnupg-home/pinentry-iz.sh");
-        avatar.execInContainer("chmod", "+x", "/tmp/gnupg-home/pinentry-iz.sh");
-
-        // Attach KeyMaster with GPG service
+        // Attach KeyMaster with GPG service — km-gpg-sa handles all GPG setup:
+        // avatar API connect, cert fetch, GNUPGHOME config, LEARN, import, ownertrust
         KeyMaster km = new KeyMaster(TEST_MNEMONIC);
         km.createIdentity("alice@atlanta.com");
 
@@ -267,25 +239,11 @@ class KeyMasterAvatarTest {
         String sessionId = km.attach(descriptor);
         assertNotNull(sessionId, "Session ID should not be null after attach");
 
-        // Channels are derived immediately from xpubs — no service.spawn delay needed
-        Thread.sleep(500);
+        // Wait for km-gpg-sa to complete GPG setup
+        // (connect to avatar, fetch cert, write configs, LEARN, import, ownertrust)
+        Thread.sleep(8000);
 
-        avatar.execInContainer("chmod", "700", "/tmp/gnupg-home");
-
-        // Kill any existing gpg-agent and run SCD LEARN to discover keys.
-        // iz-scdaemon imports the cert synchronously before its Assuan greeting,
-        // so a single LEARN is sufficient — keygrips match from the first pass.
-        avatar.execInContainer(
-                "gpgconf", "--homedir", "/tmp/gnupg-home", "--kill", "gpg-agent");
-        Thread.sleep(1000);
-
-        var learnResult = avatar.execInContainer("bash", "-c",
-                "gpg-connect-agent --homedir /tmp/gnupg-home " +
-                "'LEARN --sendinfo --force' /bye 2>&1");
-        log.info("SCD LEARN: exit={}, stdout={}",
-                learnResult.getExitCode(), learnResult.getStdout());
-
-        // Sign a test message
+        // Sign a test message — should work without any manual GPG setup
         avatar.execInContainer("bash", "-c", "echo 'test message' > /tmp/test.txt");
 
         var signResult = avatar.execInContainer(
@@ -306,6 +264,43 @@ class KeyMasterAvatarTest {
                 verifyResult.getExitCode(), verifyResult.getStdout(), verifyResult.getStderr());
         assertEquals(0, verifyResult.getExitCode(),
                 "GPG verify should succeed. stderr: " + verifyResult.getStderr());
+
+        km.detach();
+    }
+
+    @Test
+    void serviceProcessRespawnsOnCrash() throws Exception {
+        KeyMaster km = new KeyMaster(TEST_MNEMONIC);
+        km.createIdentity("alice@atlanta.com");
+
+        String relayUrl = "ws://" + relay.getHost() + ":" + relay.getMappedPort(7777);
+        AvatarDescriptor descriptor = new AvatarDescriptor(relayUrl, avatarLoginXpub, List.of("ssh"));
+
+        String sessionId = km.attach(descriptor);
+        assertNotNull(sessionId, "Session ID should not be null after attach");
+
+        // Wait for km-ssh-sa to be spawned and start
+        Thread.sleep(2000);
+
+        // Verify SSH agent is working
+        var result1 = avatar.execInContainer("ssh-add", "-l");
+        assertEquals(0, result1.getExitCode(),
+                "ssh-add should work before kill. stderr: " + result1.getStderr());
+
+        // Kill km-ssh-sa inside the container
+        var killResult = avatar.execInContainer("pkill", "km-ssh-sa");
+        log.info("pkill exit={}, stdout={}, stderr={}",
+                killResult.getExitCode(), killResult.getStdout(), killResult.getStderr());
+
+        // Wait for respawn (1s delay + startup time)
+        Thread.sleep(3000);
+
+        // Verify SSH agent works again after respawn
+        var result2 = avatar.execInContainer("ssh-add", "-l");
+        log.info("ssh-add after respawn: exit={}, stdout={}, stderr={}",
+                result2.getExitCode(), result2.getStdout(), result2.getStderr());
+        assertEquals(0, result2.getExitCode(),
+                "ssh-add should work after respawn. stderr: " + result2.getStderr());
 
         km.detach();
     }
