@@ -2,9 +2,13 @@ package club.dwdc.keymaster.e2etest;
 
 import club.dwdc.keymaster.AvatarDescriptor;
 import club.dwdc.keymaster.KeyMaster;
+import club.dwdc.keyvault.core.Bip32KeyVault;
+import club.dwdc.keyvault.core.KeyVault;
+import club.dwdc.keyvault.desktop.FileSeedStore;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.GenericContainer;
@@ -14,6 +18,7 @@ import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.images.builder.ImageFromDockerfile;
 import org.testcontainers.utility.MountableFile;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -54,6 +59,13 @@ class KeyMasterAvatarTest {
             "scd.shim.binary",
             "/home/rene/git/club.dwdc.keymaster.avatar/target/release/scd-shim");
 
+    private static final String KV_CLI_JAR = System.getProperty(
+            "kv.cli.jar",
+            "/home/rene/git/club.dwdc.keyvault/club.dwdc.keyvault.cli/target/kv-cli.jar");
+
+    @TempDir
+    static Path kvHome;
+
     private static Network network;
 
     @SuppressWarnings("resource")
@@ -69,6 +81,27 @@ class KeyMasterAvatarTest {
 
     @BeforeAll
     static void startContainers() throws Exception {
+        // Import test mnemonic via kv-cli (verifies full CLI → storage chain)
+        ProcessBuilder importPb = new ProcessBuilder(
+                "java", "-jar", KV_CLI_JAR, "seed", "import");
+        importPb.environment().put("KV_HOME", kvHome.toString());
+        importPb.redirectErrorStream(true);
+        Process importProc = importPb.start();
+        importProc.getOutputStream().write((TEST_MNEMONIC + "\n\n").getBytes(StandardCharsets.UTF_8));
+        importProc.getOutputStream().close();
+        int importExit = importProc.waitFor();
+        assertEquals(0, importExit, "kv-cli seed import should succeed");
+
+        // Verify the seed was stored
+        ProcessBuilder existsPb = new ProcessBuilder(
+                "java", "-jar", KV_CLI_JAR, "seed", "exists");
+        existsPb.environment().put("KV_HOME", kvHome.toString());
+        Process existsProc = existsPb.start();
+        int existsExit = existsProc.waitFor();
+        assertEquals(0, existsExit, "seed should exist after import");
+
+        log.info("Test seed imported via kv-cli into {}", kvHome);
+
         network = Network.newNetwork();
 
         // Start strfry relay (tmpfs for LMDB data dir, custom config to disable write policy)
@@ -84,8 +117,8 @@ class KeyMasterAvatarTest {
         relay.start();
         log.info("Relay started on port {}", relay.getMappedPort(7777));
 
-        // Build sshd target container with authorized_keys from test mnemonic
-        KeyMaster kmForKeys = new KeyMaster(TEST_MNEMONIC);
+        // Build sshd target container with authorized_keys from stored seed
+        KeyMaster kmForKeys = createKeyMaster();
         kmForKeys.createIdentity("alice@atlanta.com");
         String authorizedKeys = kmForKeys.getSshAuthorizedKeysLine();
         log.info("Authorized keys: {}", authorizedKeys);
@@ -137,7 +170,7 @@ class KeyMasterAvatarTest {
 
     @Test
     void attachToAvatar() throws Exception {
-        KeyMaster km = new KeyMaster(TEST_MNEMONIC);
+        KeyMaster km = createKeyMaster();
         km.createIdentity("alice@atlanta.com");
 
         String relayUrl = "ws://" + relay.getHost() + ":" + relay.getMappedPort(7777);
@@ -159,7 +192,7 @@ class KeyMasterAvatarTest {
 
     @Test
     void sshAddReturnsWhenAttached() throws Exception {
-        KeyMaster km = new KeyMaster(TEST_MNEMONIC);
+        KeyMaster km = createKeyMaster();
         km.createIdentity("alice@atlanta.com");
 
         String relayUrl = "ws://" + relay.getHost() + ":" + relay.getMappedPort(7777);
@@ -187,7 +220,7 @@ class KeyMasterAvatarTest {
 
     @Test
     void sshLoginToRemoteHost() throws Exception {
-        KeyMaster km = new KeyMaster(TEST_MNEMONIC);
+        KeyMaster km = createKeyMaster();
         km.createIdentity("alice@atlanta.com");
 
         String relayUrl = "ws://" + relay.getHost() + ":" + relay.getMappedPort(7777);
@@ -230,7 +263,7 @@ class KeyMasterAvatarTest {
     void gpgSignAndVerify() throws Exception {
         // Attach KeyMaster with GPG service — km-gpg-sa handles all GPG setup:
         // avatar API connect, cert fetch, GNUPGHOME config, LEARN, import, ownertrust
-        KeyMaster km = new KeyMaster(TEST_MNEMONIC);
+        KeyMaster km = createKeyMaster();
         km.createIdentity("alice@atlanta.com");
 
         String relayUrl = "ws://" + relay.getHost() + ":" + relay.getMappedPort(7777);
@@ -270,7 +303,7 @@ class KeyMasterAvatarTest {
 
     @Test
     void serviceProcessRespawnsOnCrash() throws Exception {
-        KeyMaster km = new KeyMaster(TEST_MNEMONIC);
+        KeyMaster km = createKeyMaster();
         km.createIdentity("alice@atlanta.com");
 
         String relayUrl = "ws://" + relay.getHost() + ":" + relay.getMappedPort(7777);
@@ -311,6 +344,13 @@ class KeyMasterAvatarTest {
         String logs = avatar.getLogs();
         assertFalse(logs.contains("service.spawn"),
                 "Avatar logs should not contain 'service.spawn' — channels are derived from xpubs");
+    }
+
+    /** Load mnemonic from FileSeedStore and create a KeyMaster. */
+    private static KeyMaster createKeyMaster() {
+        FileSeedStore store = new FileSeedStore(kvHome);
+        KeyVault vault = new Bip32KeyVault(store.getMnemonic(), store.getPassphrase());
+        return new KeyMaster(vault);
     }
 
     @AfterAll

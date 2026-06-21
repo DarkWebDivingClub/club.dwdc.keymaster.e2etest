@@ -37,6 +37,18 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <groupId>club.dwdc</groupId>
+            <artifactId>club.dwdc.keyvault.core</artifactId>
+            <version>${keymaster.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>club.dwdc</groupId>
+            <artifactId>club.dwdc.keyvault.desktop</artifactId>
+            <version>${keymaster.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <version>${junit.version}</version>
