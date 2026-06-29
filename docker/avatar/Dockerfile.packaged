@@ -1,0 +1,22 @@
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-client gnupg procps && rm -rf /var/lib/apt/lists/*
+
+# Avatar binary in /usr/bin — deliberately NOT a sibling to SAs
+COPY keymaster-avatar /usr/bin/keymaster-avatar
+RUN chmod +x /usr/bin/keymaster-avatar
+
+# SA binaries + scd-shim in /usr/lib/keymaster-avatar/ — NOT on PATH
+RUN mkdir -p /usr/lib/keymaster-avatar
+COPY km-ssh-sa /usr/lib/keymaster-avatar/km-ssh-sa
+COPY km-gpg-sa /usr/lib/keymaster-avatar/km-gpg-sa
+COPY scd-shim  /usr/lib/keymaster-avatar/scd-shim
+RUN chmod +x /usr/lib/keymaster-avatar/*
+
+# Config: avatar finds SAs via service_avatar_dir
+RUN mkdir -p /etc/keymaster-avatar
+COPY avatar.toml /etc/keymaster-avatar/avatar.toml
+
+COPY entrypoint-packaged.sh /usr/bin/entrypoint-packaged.sh
+RUN chmod +x /usr/bin/entrypoint-packaged.sh
+ENTRYPOINT ["entrypoint-packaged.sh"]
