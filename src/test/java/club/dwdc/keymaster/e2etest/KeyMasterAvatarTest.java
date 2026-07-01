@@ -145,7 +145,8 @@ class KeyMasterAvatarTest {
         log.info("km-daemon started, listening on {}", socketPath);
 
         // Create identity via km-cli
-        int createExit = runKmCli("identity", "create", "alice@atlanta.com");
+        int createExit = runKmCli("identity", "create", "alice@atlanta.com",
+                "--name", "Alice");
         assertEquals(0, createExit, "km-cli identity create should succeed");
         log.info("Identity created via km-cli");
 
