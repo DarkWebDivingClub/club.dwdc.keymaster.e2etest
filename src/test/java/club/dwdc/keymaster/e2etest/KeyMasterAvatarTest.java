@@ -21,11 +21,28 @@ import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.images.builder.ImageFromDockerfile;
 import org.testcontainers.utility.MountableFile;
 
+import com.google.gson.JsonParser;
+import nostr.crypto.nip44.EncryptedPayloads;
+import nostr.util.NostrUtil;
+import org.bouncycastle.asn1.x9.X9ECParameters;
+import org.bouncycastle.crypto.ec.CustomNamedCurves;
+import org.bouncycastle.math.ec.ECPoint;
+
+import javax.crypto.Cipher;
+import javax.crypto.Mac;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.SecureRandom;
+import java.security.Security;
+import java.util.Base64;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
@@ -65,6 +82,10 @@ class KeyMasterAvatarTest {
     private static final String GPG_AVATAR_BINARY = System.getProperty(
             "gpg.avatar.binary",
             "/home/rene/git/club.dwdc.keymaster.avatar/target/release/km-gpg-sa");
+
+    private static final String NOSTR_AVATAR_BINARY = System.getProperty(
+            "nostr.avatar.binary",
+            "/home/rene/git/club.dwdc.keymaster.avatar/target/release/km-nostr-sa");
 
     private static final String SCD_SHIM_BINARY = System.getProperty(
             "scd.shim.binary",
@@ -108,6 +129,11 @@ class KeyMasterAvatarTest {
 
     @BeforeAll
     static void startContainers() throws Exception {
+        // Register BouncyCastle for ChaCha20 (needed by NIP-44 local crypto)
+        if (Security.getProvider("BC") == null) {
+            Security.insertProviderAt(new BouncyCastleProvider(), 1);
+        }
+
         // Import test mnemonic via kv-cli (verifies full CLI → storage chain)
         ProcessBuilder importPb = new ProcessBuilder(
                 "java", "-jar", KV_CLI_JAR, "seed", "import");
@@ -190,6 +216,7 @@ class KeyMasterAvatarTest {
                 .withFileFromPath("keymaster-avatar", Path.of(AVATAR_BINARY))
                 .withFileFromPath("km-ssh-sa", Path.of(SSH_AVATAR_BINARY))
                 .withFileFromPath("km-gpg-sa", Path.of(GPG_AVATAR_BINARY))
+                .withFileFromPath("km-nostr-sa", Path.of(NOSTR_AVATAR_BINARY))
                 .withFileFromPath("scd-shim", Path.of(SCD_SHIM_BINARY))
                 .withFileFromPath("entrypoint.sh", Path.of("docker/avatar/entrypoint.sh"));
 
@@ -222,6 +249,7 @@ class KeyMasterAvatarTest {
                 .withFileFromPath("keymaster-avatar", Path.of(AVATAR_BINARY))
                 .withFileFromPath("km-ssh-sa", Path.of(SSH_AVATAR_BINARY))
                 .withFileFromPath("km-gpg-sa", Path.of(GPG_AVATAR_BINARY))
+                .withFileFromPath("km-nostr-sa", Path.of(NOSTR_AVATAR_BINARY))
                 .withFileFromPath("scd-shim", Path.of(SCD_SHIM_BINARY))
                 .withFileFromPath("entrypoint-packaged.sh", Path.of("docker/avatar/entrypoint-packaged.sh"))
                 .withFileFromString("avatar.toml", avatarToml);
@@ -414,6 +442,406 @@ class KeyMasterAvatarTest {
         }
     }
 
+    // ==================== Nostr service avatar tests ====================
+
+    @Test
+    @Order(33)
+    void nostrGetPublicKeys() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-nostr-keys.json", "nostr");
+
+        int attachExit = runKmCli("attach", descriptorFile.toString(),
+                "--identity", "alice@atlanta.com", "--policy", "auto");
+        assertEquals(0, attachExit, "km-cli attach should succeed");
+
+        try {
+            Thread.sleep(3000);
+
+            // Verify km-nostr-sa socket exists
+            var socketResult = avatar.execInContainer("test", "-S",
+                    "/tmp/keymaster-nostr-sa.sock");
+            assertEquals(0, socketResult.getExitCode(),
+                    "Nostr SA socket should exist. stderr: " + socketResult.getStderr());
+
+            // Request public keys via km-nostr-sa
+            String request = "{\"jsonrpc\":\"2.0\",\"method\":\"get_public_keys\",\"params\":{},\"id\":1}";
+            String response = nostrSaRequest(avatar, request);
+            log.info("get_public_keys response: {}", response);
+
+            // Parse response — should contain at least one public key (64-char hex)
+            var respObj = JsonParser.parseString(response).getAsJsonObject();
+            assertNotNull(respObj.get("result"), "Response should have result. Full: " + response);
+            var keys = respObj.getAsJsonArray("result");
+            assertFalse(keys.isEmpty(), "Should have at least one public key");
+
+            String pubkeyHex = keys.get(0).getAsJsonObject().get("public_key").getAsString();
+            assertEquals(64, pubkeyHex.length(),
+                    "Public key should be 64-char hex (32 bytes)");
+            log.info("Nostr public key: {}", pubkeyHex);
+        } finally {
+            runKmCli("detach");
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(34)
+    void nostrSignEvent() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-nostr-sign.json", "nostr");
+
+        int attachExit = runKmCli("attach", descriptorFile.toString(),
+                "--identity", "alice@atlanta.com", "--policy", "auto");
+        assertEquals(0, attachExit, "km-cli attach should succeed");
+
+        try {
+            Thread.sleep(3000);
+
+            // First get the public key
+            String keysRequest = "{\"jsonrpc\":\"2.0\",\"method\":\"get_public_keys\",\"params\":{},\"id\":1}";
+            String keysResponse = nostrSaRequest(avatar, keysRequest);
+            var keysObj = JsonParser.parseString(keysResponse).getAsJsonObject();
+            String pubkeyHex = keysObj.getAsJsonArray("result")
+                    .get(0).getAsJsonObject().get("public_key").getAsString();
+
+            // Create a test event hash (32 bytes of 0xAB as hex)
+            String eventHashHex = "ab".repeat(32);
+
+            // Sign the event
+            String signRequest = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"sign_event\",\"params\":" +
+                    "{\"public_key\":\"%s\",\"event_hash\":\"%s\"},\"id\":2}",
+                    pubkeyHex, eventHashHex);
+            String signResponse = nostrSaRequest(avatar, signRequest);
+            log.info("sign_event response: {}", signResponse);
+
+            var signObj = JsonParser.parseString(signResponse).getAsJsonObject();
+            assertNotNull(signObj.get("result"),
+                    "sign_event should have result. Full: " + signResponse);
+
+            String sigHex = signObj.getAsJsonObject("result").get("signature").getAsString();
+            assertEquals(128, sigHex.length(),
+                    "Schnorr signature should be 128-char hex (64 bytes)");
+            log.info("Schnorr signature: {}", sigHex);
+        } finally {
+            runKmCli("detach");
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(35)
+    void nostrNip04EncryptDecrypt() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-nostr-nip04.json", "nostr");
+
+        int attachExit = runKmCli("attach", descriptorFile.toString(),
+                "--identity", "alice@atlanta.com", "--policy", "auto");
+        assertEquals(0, attachExit, "km-cli attach should succeed");
+
+        try {
+            Thread.sleep(3000);
+
+            // Get Alice's public key
+            String keysRequest = "{\"jsonrpc\":\"2.0\",\"method\":\"get_public_keys\",\"params\":{},\"id\":1}";
+            String keysResponse = nostrSaRequest(avatar, keysRequest);
+            var keysObj = JsonParser.parseString(keysResponse).getAsJsonObject();
+            String alicePubkey = keysObj.getAsJsonArray("result")
+                    .get(0).getAsJsonObject().get("public_key").getAsString();
+
+            // NIP-04 encrypt (Alice encrypts to herself as peer for round-trip test)
+            String plaintext = "hello-nip04-roundtrip";
+            String encRequest = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"nip04_encrypt\",\"params\":" +
+                    "{\"public_key\":\"%s\",\"peer_public_key\":\"%s\",\"plaintext\":\"%s\"},\"id\":2}",
+                    alicePubkey, alicePubkey, plaintext);
+            String encResponse = nostrSaRequest(avatar, encRequest);
+            log.info("nip04_encrypt response: {}", encResponse);
+
+            var encObj = JsonParser.parseString(encResponse).getAsJsonObject();
+            assertNotNull(encObj.get("result"),
+                    "nip04_encrypt should have result. Full: " + encResponse);
+            String ciphertext = encObj.getAsJsonObject("result").get("ciphertext").getAsString();
+            assertFalse(ciphertext.isEmpty(), "Ciphertext should not be empty");
+            assertTrue(ciphertext.contains("?iv="), "NIP-04 ciphertext should contain ?iv= separator");
+            log.info("NIP-04 ciphertext: {}", ciphertext);
+
+            // NIP-04 decrypt (same key pair — ECDH shared secret is identical)
+            String decRequest = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"nip04_decrypt\",\"params\":" +
+                    "{\"public_key\":\"%s\",\"peer_public_key\":\"%s\",\"ciphertext\":\"%s\"},\"id\":3}",
+                    alicePubkey, alicePubkey, ciphertext);
+            String decResponse = nostrSaRequest(avatar, decRequest);
+            log.info("nip04_decrypt response: {}", decResponse);
+
+            var decObj = JsonParser.parseString(decResponse).getAsJsonObject();
+            assertNotNull(decObj.get("result"),
+                    "nip04_decrypt should have result. Full: " + decResponse);
+            String decrypted = decObj.getAsJsonObject("result").get("plaintext").getAsString();
+            assertEquals(plaintext, decrypted, "NIP-04 round-trip should recover original plaintext");
+            log.info("NIP-04 round-trip OK: {}", decrypted);
+        } finally {
+            runKmCli("detach");
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(36)
+    void nostrNip44EncryptDecrypt() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-nostr-nip44.json", "nostr");
+
+        int attachExit = runKmCli("attach", descriptorFile.toString(),
+                "--identity", "alice@atlanta.com", "--policy", "auto");
+        assertEquals(0, attachExit, "km-cli attach should succeed");
+
+        try {
+            Thread.sleep(3000);
+
+            // Get Alice's public key
+            String keysRequest = "{\"jsonrpc\":\"2.0\",\"method\":\"get_public_keys\",\"params\":{},\"id\":1}";
+            String keysResponse = nostrSaRequest(avatar, keysRequest);
+            var keysObj = JsonParser.parseString(keysResponse).getAsJsonObject();
+            String alicePubkey = keysObj.getAsJsonArray("result")
+                    .get(0).getAsJsonObject().get("public_key").getAsString();
+
+            // NIP-44 encrypt (Alice encrypts to herself as peer for round-trip test)
+            String plaintext = "hello-nip44-roundtrip";
+            String encRequest = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"nip44_encrypt\",\"params\":" +
+                    "{\"public_key\":\"%s\",\"peer_public_key\":\"%s\",\"plaintext\":\"%s\"},\"id\":2}",
+                    alicePubkey, alicePubkey, plaintext);
+            String encResponse = nostrSaRequest(avatar, encRequest);
+            log.info("nip44_encrypt response: {}", encResponse);
+
+            var encObj = JsonParser.parseString(encResponse).getAsJsonObject();
+            assertNotNull(encObj.get("result"),
+                    "nip44_encrypt should have result. Full: " + encResponse);
+            String ciphertext = encObj.getAsJsonObject("result").get("ciphertext").getAsString();
+            assertFalse(ciphertext.isEmpty(), "Ciphertext should not be empty");
+            log.info("NIP-44 ciphertext: {}", ciphertext);
+
+            // NIP-44 decrypt (same key pair — ECDH shared secret is identical)
+            String decRequest = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"nip44_decrypt\",\"params\":" +
+                    "{\"public_key\":\"%s\",\"peer_public_key\":\"%s\",\"ciphertext\":\"%s\"},\"id\":3}",
+                    alicePubkey, alicePubkey, ciphertext);
+            String decResponse = nostrSaRequest(avatar, decRequest);
+            log.info("nip44_decrypt response: {}", decResponse);
+
+            var decObj = JsonParser.parseString(decResponse).getAsJsonObject();
+            assertNotNull(decObj.get("result"),
+                    "nip44_decrypt should have result. Full: " + decResponse);
+            String decrypted = decObj.getAsJsonObject("result").get("plaintext").getAsString();
+            assertEquals(plaintext, decrypted, "NIP-44 round-trip should recover original plaintext");
+            log.info("NIP-44 round-trip OK: {}", decrypted);
+        } finally {
+            runKmCli("detach");
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(37)
+    void nostrNip04EncryptDecryptWithNonKmPeer() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-nostr-nip04-xpeer.json", "nostr");
+
+        int attachExit = runKmCli("attach", descriptorFile.toString(),
+                "--identity", "alice@atlanta.com", "--policy", "auto");
+        assertEquals(0, attachExit, "km-cli attach should succeed");
+
+        try {
+            Thread.sleep(3000);
+
+            // Get Alice's (KM-managed) public key
+            String keysRequest = "{\"jsonrpc\":\"2.0\",\"method\":\"get_public_keys\",\"params\":{},\"id\":1}";
+            String keysResponse = nostrSaRequest(avatar, keysRequest);
+            var keysObj = JsonParser.parseString(keysResponse).getAsJsonObject();
+            String alicePubkeyHex = keysObj.getAsJsonArray("result")
+                    .get(0).getAsJsonObject().get("public_key").getAsString();
+
+            // Bob: generate ephemeral secp256k1 keypair (no KM)
+            X9ECParameters secp = CustomNamedCurves.getByName("secp256k1");
+            byte[] bobPrivKey = new byte[32];
+            new SecureRandom().nextBytes(bobPrivKey);
+            ECPoint bobPubPoint = secp.getG().multiply(new BigInteger(1, bobPrivKey)).normalize();
+            byte[] bobPubKey = bobPubPoint.getAffineXCoord().getEncoded();
+            String bobPubkeyHex = NostrUtil.bytesToHex(bobPubKey);
+
+            // Bob computes ECDH shared secret with Alice
+            byte[] alicePubBytes = NostrUtil.hexToBytes(alicePubkeyHex);
+            ECPoint alicePoint = liftX(secp, alicePubBytes);
+            byte[] sharedX = alicePoint.multiply(new BigInteger(1, bobPrivKey))
+                    .normalize().getAffineXCoord().getEncoded();
+
+            // --- Alice → Bob: KM encrypts, Bob decrypts ---
+            String plaintext1 = "hello-nip04-alice-to-bob";
+            String encRequest = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"nip04_encrypt\",\"params\":" +
+                    "{\"public_key\":\"%s\",\"peer_public_key\":\"%s\",\"plaintext\":\"%s\"},\"id\":2}",
+                    alicePubkeyHex, bobPubkeyHex, plaintext1);
+            String encResponse = nostrSaRequest(avatar, encRequest);
+            var encObj = JsonParser.parseString(encResponse).getAsJsonObject();
+            assertNotNull(encObj.get("result"),
+                    "nip04_encrypt should have result. Full: " + encResponse);
+            String ciphertext1 = encObj.getAsJsonObject("result").get("ciphertext").getAsString();
+
+            // Bob decrypts locally using the shared secret
+            String decrypted1 = nip04DecryptLocal(sharedX, ciphertext1);
+            assertEquals(plaintext1, decrypted1,
+                    "Bob (non-KM) should decrypt Alice's NIP-04 message");
+            log.info("NIP-04 cross-peer Alice→Bob OK: {}", decrypted1);
+
+            // --- Bob → Alice: Bob encrypts, KM decrypts ---
+            String plaintext2 = "hello-nip04-bob-to-alice";
+            String ciphertext2 = nip04EncryptLocal(sharedX, plaintext2);
+
+            String decRequest = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"nip04_decrypt\",\"params\":" +
+                    "{\"public_key\":\"%s\",\"peer_public_key\":\"%s\",\"ciphertext\":\"%s\"},\"id\":3}",
+                    alicePubkeyHex, bobPubkeyHex, ciphertext2);
+            String decResponse = nostrSaRequest(avatar, decRequest);
+            var decObj = JsonParser.parseString(decResponse).getAsJsonObject();
+            assertNotNull(decObj.get("result"),
+                    "nip04_decrypt should have result. Full: " + decResponse);
+            String decrypted2 = decObj.getAsJsonObject("result").get("plaintext").getAsString();
+            assertEquals(plaintext2, decrypted2,
+                    "Alice (KM) should decrypt Bob's NIP-04 message");
+            log.info("NIP-04 cross-peer Bob→Alice OK: {}", decrypted2);
+        } finally {
+            runKmCli("detach");
+            Thread.sleep(500);
+        }
+    }
+
+    @Test
+    @Order(38)
+    void nostrNip44EncryptDecryptWithNonKmPeer() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-nostr-nip44-xpeer.json", "nostr");
+
+        int attachExit = runKmCli("attach", descriptorFile.toString(),
+                "--identity", "alice@atlanta.com", "--policy", "auto");
+        assertEquals(0, attachExit, "km-cli attach should succeed");
+
+        try {
+            Thread.sleep(3000);
+
+            // Get Alice's (KM-managed) public key
+            String keysRequest = "{\"jsonrpc\":\"2.0\",\"method\":\"get_public_keys\",\"params\":{},\"id\":1}";
+            String keysResponse = nostrSaRequest(avatar, keysRequest);
+            var keysObj = JsonParser.parseString(keysResponse).getAsJsonObject();
+            String alicePubkeyHex = keysObj.getAsJsonArray("result")
+                    .get(0).getAsJsonObject().get("public_key").getAsString();
+
+            // Bob: generate ephemeral secp256k1 keypair (no KM)
+            X9ECParameters secp = CustomNamedCurves.getByName("secp256k1");
+            byte[] bobPrivKey = new byte[32];
+            new SecureRandom().nextBytes(bobPrivKey);
+            ECPoint bobPubPoint = secp.getG().multiply(new BigInteger(1, bobPrivKey)).normalize();
+            byte[] bobPubKey = bobPubPoint.getAffineXCoord().getEncoded();
+            String bobPubkeyHex = NostrUtil.bytesToHex(bobPubKey);
+
+            // Bob computes ECDH shared secret with Alice
+            byte[] alicePubBytes = NostrUtil.hexToBytes(alicePubkeyHex);
+            ECPoint alicePoint = liftX(secp, alicePubBytes);
+            byte[] sharedX = alicePoint.multiply(new BigInteger(1, bobPrivKey))
+                    .normalize().getAffineXCoord().getEncoded();
+
+            // Derive NIP-44 conversation key from shared secret
+            byte[] conversationKey = nip44ConversationKey(sharedX);
+
+            // --- Alice → Bob: KM encrypts, Bob decrypts ---
+            String plaintext1 = "hello-nip44-alice-to-bob";
+            String encRequest = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"nip44_encrypt\",\"params\":" +
+                    "{\"public_key\":\"%s\",\"peer_public_key\":\"%s\",\"plaintext\":\"%s\"},\"id\":2}",
+                    alicePubkeyHex, bobPubkeyHex, plaintext1);
+            String encResponse = nostrSaRequest(avatar, encRequest);
+            var encObj = JsonParser.parseString(encResponse).getAsJsonObject();
+            assertNotNull(encObj.get("result"),
+                    "nip44_encrypt should have result. Full: " + encResponse);
+            String ciphertext1 = encObj.getAsJsonObject("result").get("ciphertext").getAsString();
+
+            // Bob decrypts locally using conversation key
+            String decrypted1 = EncryptedPayloads.decrypt(ciphertext1, conversationKey);
+            assertEquals(plaintext1, decrypted1,
+                    "Bob (non-KM) should decrypt Alice's NIP-44 message");
+            log.info("NIP-44 cross-peer Alice→Bob OK: {}", decrypted1);
+
+            // --- Bob → Alice: Bob encrypts, KM decrypts ---
+            String plaintext2 = "hello-nip44-bob-to-alice";
+            byte[] nonce = NostrUtil.createRandomByteArray(32);
+            String ciphertext2 = EncryptedPayloads.encrypt(plaintext2, conversationKey, nonce);
+
+            String decRequest = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"nip44_decrypt\",\"params\":" +
+                    "{\"public_key\":\"%s\",\"peer_public_key\":\"%s\",\"ciphertext\":\"%s\"},\"id\":3}",
+                    alicePubkeyHex, bobPubkeyHex, ciphertext2);
+            String decResponse = nostrSaRequest(avatar, decRequest);
+            var decObj = JsonParser.parseString(decResponse).getAsJsonObject();
+            assertNotNull(decObj.get("result"),
+                    "nip44_decrypt should have result. Full: " + decResponse);
+            String decrypted2 = decObj.getAsJsonObject("result").get("plaintext").getAsString();
+            assertEquals(plaintext2, decrypted2,
+                    "Alice (KM) should decrypt Bob's NIP-44 message");
+            log.info("NIP-44 cross-peer Bob→Alice OK: {}", decrypted2);
+        } finally {
+            runKmCli("detach");
+            Thread.sleep(500);
+        }
+    }
+
+    // ==================== Cross-peer crypto helpers ====================
+
+    /**
+     * Lift an x-only (32-byte) public key to a full EC point.
+     * Picks the even-y coordinate per BIP-340.
+     */
+    private static ECPoint liftX(X9ECParameters curve, byte[] xBytes) {
+        BigInteger x = new BigInteger(1, xBytes);
+        BigInteger p = curve.getCurve().getField().getCharacteristic();
+        BigInteger a = curve.getCurve().getA().toBigInteger();
+        BigInteger b = curve.getCurve().getB().toBigInteger();
+
+        // y^2 = x^3 + ax + b  (mod p)
+        BigInteger rhs = x.modPow(BigInteger.valueOf(3), p)
+                .add(a.multiply(x)).add(b).mod(p);
+        BigInteger y = rhs.modPow(p.add(BigInteger.ONE).divide(BigInteger.valueOf(4)), p);
+        // Pick even y
+        if (y.testBit(0)) {
+            y = p.subtract(y);
+        }
+        return curve.getCurve().createPoint(x, y);
+    }
+
+    /** NIP-04 encrypt locally using a pre-computed ECDH shared x-coordinate. */
+    private static String nip04EncryptLocal(byte[] sharedX, String plaintext) throws Exception {
+        SecretKeySpec keySpec = new SecretKeySpec(sharedX, "AES");
+        byte[] iv = new byte[16];
+        new SecureRandom().nextBytes(iv);
+        Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+        cipher.init(Cipher.ENCRYPT_MODE, keySpec, new IvParameterSpec(iv));
+        byte[] encrypted = cipher.doFinal(plaintext.getBytes(StandardCharsets.UTF_8));
+        return Base64.getEncoder().encodeToString(encrypted)
+                + "?iv=" + Base64.getEncoder().encodeToString(iv);
+    }
+
+    /** NIP-04 decrypt locally using a pre-computed ECDH shared x-coordinate. */
+    private static String nip04DecryptLocal(byte[] sharedX, String ciphertext) throws Exception {
+        String[] parts = ciphertext.split("\\?iv=");
+        byte[] ct = Base64.getDecoder().decode(parts[0]);
+        byte[] iv = Base64.getDecoder().decode(parts[1]);
+        SecretKeySpec keySpec = new SecretKeySpec(sharedX, "AES");
+        Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+        cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(iv));
+        return new String(cipher.doFinal(ct), StandardCharsets.UTF_8);
+    }
+
+    /** Derive NIP-44 conversation key: HKDF-Extract(salt="nip44-v2", ikm=shared_x). */
+    private static byte[] nip44ConversationKey(byte[] sharedX) throws Exception {
+        byte[] salt = "nip44-v2".getBytes(StandardCharsets.UTF_8);
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(salt, "HmacSHA256"));
+        return mac.doFinal(sharedX);
+    }
+
     // ==================== Packaged layout tests ====================
     // These test the "installed as a .deb" scenario: binaries in /usr/lib/keymaster-avatar/
     // (off PATH), avatar in /usr/bin/, config in /etc/keymaster-avatar/.
@@ -562,6 +990,35 @@ class KeyMasterAvatarTest {
         }
 
         return proc.exitValue();
+    }
+
+    /**
+     * Send a JSON-RPC request to the km-nostr-sa socket inside a container
+     * via a Python3 helper script. Returns the JSON-RPC response string.
+     */
+    private static String nostrSaRequest(GenericContainer<?> container, String requestJson) throws Exception {
+        String script = String.join("\n",
+                "import socket,struct,sys",
+                "def recv_exact(s,n):",
+                "  d=b''",
+                "  while len(d)<n:",
+                "    c=s.recv(n-len(d))",
+                "    if not c: raise Exception('EOF')",
+                "    d+=c",
+                "  return d",
+                "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)",
+                "s.connect('/tmp/keymaster-nostr-sa.sock')",
+                "req=sys.argv[1].encode()",
+                "s.sendall(struct.pack('>I',len(req))+req)",
+                "n=struct.unpack('>I',recv_exact(s,4))[0]",
+                "print(recv_exact(s,n).decode())",
+                "s.close()");
+        var result = container.execInContainer("python3", "-c", script, requestJson);
+        if (result.getExitCode() != 0) {
+            throw new RuntimeException("nostr-sa request failed (exit=" + result.getExitCode()
+                    + "): " + result.getStderr());
+        }
+        return result.getStdout().trim();
     }
 
     /**
