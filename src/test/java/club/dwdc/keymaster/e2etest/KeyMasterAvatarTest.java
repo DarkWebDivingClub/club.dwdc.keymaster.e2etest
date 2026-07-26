@@ -1,6 +1,6 @@
 package club.dwdc.keymaster.e2etest;
 
-import club.dwdc.keymaster.KeyMaster;
+import club.dwdc.keymaster.SshServiceHandler;
 import club.dwdc.keyvault.core.Bip32KeyVault;
 import club.dwdc.keyvault.core.KeyVault;
 import club.dwdc.keyvault.desktop.FileSeedStore;
@@ -191,10 +191,10 @@ class KeyMasterAvatarTest {
         relay.start();
         log.info("Relay started on port {}", relay.getMappedPort(7777));
 
-        // Build sshd target container — need in-process KeyMaster to get SSH authorized_keys
-        KeyMaster kmForKeys = createKeyMasterInProcess();
-        kmForKeys.deriveIdentity("alice@atlanta.com");
-        String authorizedKeys = kmForKeys.getSshAuthorizedKeysLine();
+        // Build sshd target container — derive SSH authorized_keys from vault
+        KeyVault vaultForKeys = createVaultInProcess();
+        String authorizedKeys = SshServiceHandler.getAuthorizedKeysLine(
+                vaultForKeys, "alice@atlanta.com");
         log.info("Authorized keys: {}", authorizedKeys);
 
         ImageFromDockerfile sshdImage = new ImageFromDockerfile()
@@ -788,6 +788,125 @@ class KeyMasterAvatarTest {
         }
     }
 
+    // ==================== MLS service avatar tests ====================
+
+    @Test
+    @Order(39)
+    void mlsKeyDerivationSignAndHpke() throws Exception {
+        Path descriptorFile = writeDescriptor("descriptor-nostr-mls.json", "nostr");
+
+        int attachExit = runKmCli("attach", descriptorFile.toString(),
+                "--identity", "alice@atlanta.com", "--policy", "auto");
+        assertEquals(0, attachExit, "km-cli attach should succeed");
+
+        try {
+            Thread.sleep(3000);
+
+            // 1. Get Nostr public key
+            String keysRequest = "{\"jsonrpc\":\"2.0\",\"method\":\"get_public_keys\",\"params\":{},\"id\":1}";
+            String keysResponse = nostrSaRequest(avatar, keysRequest);
+            var keysObj = JsonParser.parseString(keysResponse).getAsJsonObject();
+            String nostrPubkeyHex = keysObj.getAsJsonArray("result")
+                    .get(0).getAsJsonObject().get("public_key").getAsString();
+            log.info("Nostr pubkey: {}", nostrPubkeyHex);
+
+            // 2. get_mls_pubkey — derive Ed25519 MLS signing key
+            String mlsPubkeyReq = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"get_mls_pubkey\",\"params\":" +
+                    "{\"nostr_pubkey\":\"%s\",\"device_id\":null},\"id\":2}",
+                    nostrPubkeyHex);
+            String mlsPubkeyResp = nostrSaRequest(avatar, mlsPubkeyReq);
+            log.info("get_mls_pubkey response: {}", mlsPubkeyResp);
+
+            var mlsPubkeyObj = JsonParser.parseString(mlsPubkeyResp).getAsJsonObject();
+            assertNotNull(mlsPubkeyObj.get("result"),
+                    "get_mls_pubkey should have result. Full: " + mlsPubkeyResp);
+            String mlsPubkeyHex = mlsPubkeyObj.getAsJsonObject("result")
+                    .get("mls_pubkey").getAsString();
+            assertEquals(64, mlsPubkeyHex.length(),
+                    "MLS pubkey should be 64-char hex (32 bytes)");
+            log.info("MLS pubkey: {}", mlsPubkeyHex);
+
+            // 3. mls_sign — Ed25519 sign arbitrary data
+            String dataHex = "ab".repeat(32);
+            String mlsSignReq = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"mls_sign\",\"params\":" +
+                    "{\"mls_pubkey\":\"%s\",\"data\":\"%s\"},\"id\":3}",
+                    mlsPubkeyHex, dataHex);
+            String mlsSignResp = nostrSaRequest(avatar, mlsSignReq);
+            log.info("mls_sign response: {}", mlsSignResp);
+
+            var mlsSignObj = JsonParser.parseString(mlsSignResp).getAsJsonObject();
+            assertNotNull(mlsSignObj.get("result"),
+                    "mls_sign should have result. Full: " + mlsSignResp);
+            String sigHex = mlsSignObj.getAsJsonObject("result")
+                    .get("signature").getAsString();
+            assertEquals(128, sigHex.length(),
+                    "Ed25519 signature should be 128-char hex (64 bytes)");
+            log.info("MLS signature: {}", sigHex);
+
+            // 4. mls_hpke_pubkey_at — derive X25519 HPKE key at index 0
+            String hpkePubkeyReq = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"mls_hpke_pubkey_at\",\"params\":" +
+                    "{\"mls_pubkey\":\"%s\",\"key_type\":0,\"index\":0},\"id\":4}",
+                    mlsPubkeyHex);
+            String hpkePubkeyResp = nostrSaRequest(avatar, hpkePubkeyReq);
+            log.info("mls_hpke_pubkey_at response: {}", hpkePubkeyResp);
+
+            var hpkePubkeyObj = JsonParser.parseString(hpkePubkeyResp).getAsJsonObject();
+            assertNotNull(hpkePubkeyObj.get("result"),
+                    "mls_hpke_pubkey_at should have result. Full: " + hpkePubkeyResp);
+            String hpkePubkeyHex = hpkePubkeyObj.getAsJsonObject("result")
+                    .get("hpke_pubkey").getAsString();
+            assertEquals(64, hpkePubkeyHex.length(),
+                    "HPKE X25519 pubkey should be 64-char hex (32 bytes)");
+            log.info("HPKE pubkey: {}", hpkePubkeyHex);
+
+            // 5. mls_hpke_dh — X25519 DH with a peer public key
+            // Use a fixed 32-byte peer public key (X25519 basepoint = 9)
+            String peerPublicHex = "09" + "00".repeat(31);
+            String hpkeDhReq = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"mls_hpke_dh\",\"params\":" +
+                    "{\"hpke_pubkey\":\"%s\",\"peer_public\":\"%s\"},\"id\":5}",
+                    hpkePubkeyHex, peerPublicHex);
+            String hpkeDhResp = nostrSaRequest(avatar, hpkeDhReq);
+            log.info("mls_hpke_dh response: {}", hpkeDhResp);
+
+            var hpkeDhObj = JsonParser.parseString(hpkeDhResp).getAsJsonObject();
+            assertNotNull(hpkeDhObj.get("result"),
+                    "mls_hpke_dh should have result. Full: " + hpkeDhResp);
+            String dhResultHex = hpkeDhObj.getAsJsonObject("result")
+                    .get("dh_result").getAsString();
+            assertEquals(64, dhResultHex.length(),
+                    "DH result should be 64-char hex (32 bytes)");
+            // DH with basepoint should equal the public key itself
+            assertEquals(hpkePubkeyHex, dhResultHex,
+                    "DH(basepoint) should equal the public key");
+            log.info("HPKE DH result: {}", dhResultHex);
+
+            // 6. sign_account_identity_proof — Schnorr sign Kind 450 event
+            String proofReq = String.format(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"sign_account_identity_proof\",\"params\":" +
+                    "{\"account_identity\":\"%s\",\"mls_signature_public_key\":\"%s\"," +
+                    "\"ciphersuite\":1,\"signature_scheme\":1},\"id\":6}",
+                    nostrPubkeyHex, mlsPubkeyHex);
+            String proofResp = nostrSaRequest(avatar, proofReq);
+            log.info("sign_account_identity_proof response: {}", proofResp);
+
+            var proofObj = JsonParser.parseString(proofResp).getAsJsonObject();
+            assertNotNull(proofObj.get("result"),
+                    "sign_account_identity_proof should have result. Full: " + proofResp);
+            String proofSigHex = proofObj.getAsJsonObject("result")
+                    .get("signature").getAsString();
+            assertEquals(128, proofSigHex.length(),
+                    "Schnorr signature should be 128-char hex (64 bytes)");
+            log.info("Account identity proof signature: {}", proofSigHex);
+        } finally {
+            runKmCli("detach");
+            Thread.sleep(500);
+        }
+    }
+
     // ==================== Cross-peer crypto helpers ====================
 
     /**
@@ -1035,12 +1154,11 @@ class KeyMasterAvatarTest {
     }
 
     /**
-     * Create a KeyMaster in-process (for SSH authorized_keys derivation only).
+     * Create a KeyVault in-process (for SSH authorized_keys derivation only).
      */
-    private static KeyMaster createKeyMasterInProcess() {
+    private static KeyVault createVaultInProcess() {
         FileSeedStore store = new FileSeedStore(kvHome);
-        KeyVault vault = new Bip32KeyVault(store.getMnemonic(), store.getPassphrase());
-        return new KeyMaster(vault);
+        return new Bip32KeyVault(store.getMnemonic(), store.getPassphrase());
     }
 
     @AfterAll

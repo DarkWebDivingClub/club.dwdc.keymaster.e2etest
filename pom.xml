@@ -15,6 +15,7 @@
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <keymaster.version>0.3.0</keymaster.version>
+        <keyvault.version>0.1.0</keyvault.version>
         <junit.version>5.13.1</junit.version>
         <surefire.version>3.5.2</surefire.version>
         <testcontainers.version>1.20.6</testcontainers.version>
@@ -39,13 +40,13 @@
         <dependency>
             <groupId>club.dwdc</groupId>
             <artifactId>club.dwdc.keyvault.core</artifactId>
-            <version>${keymaster.version}</version>
+            <version>${keyvault.version}</version>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>club.dwdc</groupId>
             <artifactId>club.dwdc.keyvault.desktop</artifactId>
-            <version>${keymaster.version}</version>
+            <version>${keyvault.version}</version>
             <scope>test</scope>
         </dependency>
         <dependency>
