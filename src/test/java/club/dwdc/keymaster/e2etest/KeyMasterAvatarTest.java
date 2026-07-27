@@ -1,9 +1,12 @@
 package club.dwdc.keymaster.e2etest;
 
 import club.dwdc.keymaster.SshServiceHandler;
+import club.dwdc.keymaster.daemon.DaemonController;
+import club.dwdc.keymaster.daemon.DaemonServer;
+import club.dwdc.keymaster.desktop.FileIdentityStore;
 import club.dwdc.keyvault.core.Bip32KeyVault;
 import club.dwdc.keyvault.core.KeyVault;
-import club.dwdc.keyvault.desktop.FileSeedStore;
+import club.dwdc.keyvault.core.SeedStore;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
@@ -21,6 +24,7 @@ import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.images.builder.ImageFromDockerfile;
 import org.testcontainers.utility.MountableFile;
 
+import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import nostr.crypto.nip44.EncryptedPayloads;
 import nostr.util.NostrUtil;
@@ -34,8 +38,6 @@ import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -54,7 +56,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * E2E test: KeyMaster daemon/client with Avatar over a Nostr relay.
  *
  * <p>Uses Testcontainers to automatically start a strfry relay and keymaster-avatar
- * in Docker. Exercises the full km-daemon + km-cli subprocess chain.
+ * in Docker. Runs km-daemon in-process via embedded DaemonController/DaemonServer.
  *
  * <p>Typical run time: ~70 seconds. The 2-minute class-level timeout ensures
  * the suite never hangs indefinitely.
@@ -91,24 +93,12 @@ class KeyMasterAvatarTest {
             "scd.shim.binary",
             "/home/rene/git/club.dwdc.keymaster.avatar/target/release/scd-shim");
 
-    private static final String KV_CLI_JAR = System.getProperty(
-            "kv.cli.jar",
-            "/home/rene/git/club.dwdc.keyvault/club.dwdc.keyvault.cli/target/kv-cli.jar");
-
-    private static final String KM_DAEMON_JAR = System.getProperty(
-            "km.daemon.jar",
-            "/home/rene/git/club.dwdc.keymaster/club.dwdc.keymaster.daemon/target/km-daemon.jar");
-
-    private static final String KM_CLI_JAR = System.getProperty(
-            "km.cli.jar",
-            "/home/rene/git/club.dwdc.keymaster/club.dwdc.keymaster.cli/target/km-cli.jar");
-
     @TempDir
     static Path kvHome;
 
     private static Path socketPath;
-    private static Path daemonLogFile;
-    private static Process daemonProcess;
+    private static DaemonServer daemonServer;
+    private static DaemonController daemonController;
     private static Network network;
 
     @SuppressWarnings("resource")
@@ -134,47 +124,24 @@ class KeyMasterAvatarTest {
             Security.insertProviderAt(new BouncyCastleProvider(), 1);
         }
 
-        // Import test mnemonic via kv-cli (verifies full CLI → storage chain)
-        ProcessBuilder importPb = new ProcessBuilder(
-                "java", "-jar", KV_CLI_JAR, "seed", "import");
-        importPb.environment().put("KV_HOME", kvHome.toString());
-        importPb.redirectErrorStream(true);
-        Process importProc = importPb.start();
-        importProc.getOutputStream().write((TEST_MNEMONIC + "\n\n").getBytes(StandardCharsets.UTF_8));
-        importProc.getOutputStream().close();
-        int importExit = importProc.waitFor();
-        assertEquals(0, importExit, "kv-cli seed import should succeed");
-
-        // Verify the seed was stored
-        ProcessBuilder existsPb = new ProcessBuilder(
-                "java", "-jar", KV_CLI_JAR, "seed", "exists");
-        existsPb.environment().put("KV_HOME", kvHome.toString());
-        Process existsProc = existsPb.start();
-        int existsExit = existsProc.waitFor();
-        assertEquals(0, existsExit, "seed should exist after import");
-
-        log.info("Test seed imported via kv-cli into {}", kvHome);
-
-        // Start km-daemon as a background subprocess with log file
+        // Embedded km-daemon — no subprocesses needed
         socketPath = kvHome.resolve("keymaster.sock");
-        daemonLogFile = kvHome.resolve("km-daemon.log");
-        ProcessBuilder daemonPb = new ProcessBuilder(
-                "java", "-jar", KM_DAEMON_JAR, "--socket", socketPath.toString());
-        daemonPb.environment().put("KV_HOME", kvHome.toString());
-        daemonPb.environment().put("KM_HOME", kvHome.toString());
-        daemonPb.redirectErrorStream(true);
-        daemonPb.redirectOutput(daemonLogFile.toFile());
-        daemonProcess = daemonPb.start();
+        SeedStore seedStore = new StubSeedStore();
+        FileIdentityStore identityStore = new FileIdentityStore(kvHome);
+        daemonController = new DaemonController(seedStore, identityStore, kvHome);
+        daemonServer = new DaemonServer(socketPath, daemonController);
+        daemonServer.start();
+        log.info("Embedded km-daemon started on {}", socketPath);
 
-        // Wait for daemon to start listening
-        waitForSocket(socketPath, 10);
-        log.info("km-daemon started, listening on {}", socketPath);
-
-        // Create identity via km-cli
-        int createExit = runKmCli("identity", "create", "alice@atlanta.com",
-                "--name", "Alice");
-        assertEquals(0, createExit, "km-cli identity create should succeed");
-        log.info("Identity created via km-cli");
+        // Create identity via direct controller call
+        JsonObject createParams = new JsonObject();
+        createParams.addProperty("identity", "alice@atlanta.com");
+        createParams.addProperty("pgp_name", "Alice");
+        createParams.addProperty("pgp_email", "alice@atlanta.com");
+        JsonObject createResult = daemonController.handle("identity.create", createParams);
+        assertFalse(createResult.has("error"),
+                "identity.create failed: " + createResult);
+        log.info("Identity created: {}", createResult.get("pubkey").getAsString());
 
         network = Network.newNetwork();
 
@@ -277,9 +244,10 @@ class KeyMasterAvatarTest {
 
     @Test
     @Order(1)
-    void statusShowsNotAttached() throws Exception {
-        int exit = runKmCli("status");
-        assertEquals(0, exit, "km-cli status should succeed");
+    void statusShowsNotAttached() {
+        JsonObject result = daemonController.handle("session.status", new JsonObject());
+        assertFalse(result.has("error"), "status should not have error: " + result);
+        assertFalse(result.get("attached").getAsBoolean());
     }
 
     @Test
@@ -295,9 +263,7 @@ class KeyMasterAvatarTest {
     void attachViaCliAndSshAddWorks() throws Exception {
         Path descriptorFile = writeDescriptor("descriptor-ssh.json", "ssh");
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
             Thread.sleep(2000);
@@ -315,7 +281,7 @@ class KeyMasterAvatarTest {
             assertNotEquals(2, result.getExitCode(),
                     "ssh-add should reach the agent. stderr: " + result.getStderr());
         } finally {
-            runKmCli("detach");
+            detachViaController();
             Thread.sleep(500);
         }
     }
@@ -325,9 +291,7 @@ class KeyMasterAvatarTest {
     void sshLoginToRemoteHost() throws Exception {
         Path descriptorFile = writeDescriptor("descriptor-ssh-login.json", "ssh");
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
             Thread.sleep(2000);
@@ -355,7 +319,7 @@ class KeyMasterAvatarTest {
             assertTrue(sshResult.getStdout().contains("hello-from-keymaster"),
                     "SSH output should contain 'hello-from-keymaster'. stdout: " + sshResult.getStdout());
         } finally {
-            runKmCli("detach");
+            detachViaController();
             Thread.sleep(500);
         }
     }
@@ -365,13 +329,13 @@ class KeyMasterAvatarTest {
     void gpgSignAndVerify() throws Exception {
         Path descriptorFile = writeDescriptor("descriptor-gpg.json", "gpg");
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
-            // Wait for km-gpg-sa to complete GPG setup
-            Thread.sleep(8000);
+            // Wait for km-gpg-sa to complete GPG setup (LEARN, import, ownertrust, stubs).
+            // The direct controller attach call completes ~3s faster than the old subprocess,
+            // so km-gpg-sa needs more wall-clock time after attach to finish setup.
+            Thread.sleep(12000);
 
             // Sign a test message
             avatar.execInContainer("bash", "-c", "echo 'test message' > /tmp/test.txt");
@@ -383,11 +347,6 @@ class KeyMasterAvatarTest {
                     "/tmp/test.txt");
             log.info("GPG sign: exit={}, stdout={}, stderr={}",
                     signResult.getExitCode(), signResult.getStdout(), signResult.getStderr());
-
-            if (signResult.getExitCode() != 0) {
-                // Dump daemon log for debugging
-                log.warn("GPG sign failed. Daemon log:\n{}", Files.readString(daemonLogFile));
-            }
 
             assertEquals(0, signResult.getExitCode(),
                     "GPG clearsign should succeed. stderr: " + signResult.getStderr());
@@ -401,7 +360,7 @@ class KeyMasterAvatarTest {
             assertEquals(0, verifyResult.getExitCode(),
                     "GPG verify should succeed. stderr: " + verifyResult.getStderr());
         } finally {
-            runKmCli("detach");
+            detachViaController();
             Thread.sleep(500);
         }
     }
@@ -411,9 +370,7 @@ class KeyMasterAvatarTest {
     void serviceProcessRespawnsOnCrash() throws Exception {
         Path descriptorFile = writeDescriptor("descriptor-respawn.json", "ssh");
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
             Thread.sleep(2000);
@@ -428,8 +385,9 @@ class KeyMasterAvatarTest {
             log.info("pkill exit={}, stdout={}, stderr={}",
                     killResult.getExitCode(), killResult.getStdout(), killResult.getStderr());
 
-            // Wait for respawn
-            Thread.sleep(3000);
+            // Wait for respawn — the entrypoint restart loop needs time to relaunch km-ssh-sa
+            // and the new process needs to reconnect to the avatar's local API.
+            Thread.sleep(5000);
 
             // Verify SSH agent works again
             var result2 = avatar.execInContainer("ssh-add", "-l");
@@ -438,7 +396,7 @@ class KeyMasterAvatarTest {
             assertEquals(0, result2.getExitCode(),
                     "ssh-add should work after respawn. stderr: " + result2.getStderr());
         } finally {
-            runKmCli("detach");
+            detachViaController();
         }
     }
 
@@ -449,9 +407,7 @@ class KeyMasterAvatarTest {
     void nostrGetPublicKeys() throws Exception {
         Path descriptorFile = writeDescriptor("descriptor-nostr-keys.json", "nostr");
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
             Thread.sleep(3000);
@@ -478,7 +434,7 @@ class KeyMasterAvatarTest {
                     "Public key should be 64-char hex (32 bytes)");
             log.info("Nostr public key: {}", pubkeyHex);
         } finally {
-            runKmCli("detach");
+            detachViaController();
             Thread.sleep(500);
         }
     }
@@ -488,9 +444,7 @@ class KeyMasterAvatarTest {
     void nostrSignEvent() throws Exception {
         Path descriptorFile = writeDescriptor("descriptor-nostr-sign.json", "nostr");
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
             Thread.sleep(3000);
@@ -522,7 +476,7 @@ class KeyMasterAvatarTest {
                     "Schnorr signature should be 128-char hex (64 bytes)");
             log.info("Schnorr signature: {}", sigHex);
         } finally {
-            runKmCli("detach");
+            detachViaController();
             Thread.sleep(500);
         }
     }
@@ -532,9 +486,7 @@ class KeyMasterAvatarTest {
     void nostrNip04EncryptDecrypt() throws Exception {
         Path descriptorFile = writeDescriptor("descriptor-nostr-nip04.json", "nostr");
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
             Thread.sleep(3000);
@@ -578,7 +530,7 @@ class KeyMasterAvatarTest {
             assertEquals(plaintext, decrypted, "NIP-04 round-trip should recover original plaintext");
             log.info("NIP-04 round-trip OK: {}", decrypted);
         } finally {
-            runKmCli("detach");
+            detachViaController();
             Thread.sleep(500);
         }
     }
@@ -588,9 +540,7 @@ class KeyMasterAvatarTest {
     void nostrNip44EncryptDecrypt() throws Exception {
         Path descriptorFile = writeDescriptor("descriptor-nostr-nip44.json", "nostr");
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
             Thread.sleep(3000);
@@ -633,7 +583,7 @@ class KeyMasterAvatarTest {
             assertEquals(plaintext, decrypted, "NIP-44 round-trip should recover original plaintext");
             log.info("NIP-44 round-trip OK: {}", decrypted);
         } finally {
-            runKmCli("detach");
+            detachViaController();
             Thread.sleep(500);
         }
     }
@@ -643,9 +593,7 @@ class KeyMasterAvatarTest {
     void nostrNip04EncryptDecryptWithNonKmPeer() throws Exception {
         Path descriptorFile = writeDescriptor("descriptor-nostr-nip04-xpeer.json", "nostr");
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
             Thread.sleep(3000);
@@ -706,7 +654,7 @@ class KeyMasterAvatarTest {
                     "Alice (KM) should decrypt Bob's NIP-04 message");
             log.info("NIP-04 cross-peer Bob→Alice OK: {}", decrypted2);
         } finally {
-            runKmCli("detach");
+            detachViaController();
             Thread.sleep(500);
         }
     }
@@ -716,9 +664,7 @@ class KeyMasterAvatarTest {
     void nostrNip44EncryptDecryptWithNonKmPeer() throws Exception {
         Path descriptorFile = writeDescriptor("descriptor-nostr-nip44-xpeer.json", "nostr");
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
             Thread.sleep(3000);
@@ -783,7 +729,7 @@ class KeyMasterAvatarTest {
                     "Alice (KM) should decrypt Bob's NIP-44 message");
             log.info("NIP-44 cross-peer Bob→Alice OK: {}", decrypted2);
         } finally {
-            runKmCli("detach");
+            detachViaController();
             Thread.sleep(500);
         }
     }
@@ -795,9 +741,7 @@ class KeyMasterAvatarTest {
     void mlsKeyDerivationSignAndHpke() throws Exception {
         Path descriptorFile = writeDescriptor("descriptor-nostr-mls.json", "nostr");
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
             Thread.sleep(3000);
@@ -902,7 +846,7 @@ class KeyMasterAvatarTest {
                     "Schnorr signature should be 128-char hex (64 bytes)");
             log.info("Account identity proof signature: {}", proofSigHex);
         } finally {
-            runKmCli("detach");
+            detachViaController();
             Thread.sleep(500);
         }
     }
@@ -983,9 +927,7 @@ class KeyMasterAvatarTest {
         Path descriptorFile = writeDescriptor("descriptor-pkg-ssh.json", "ssh",
                 avatarPackagedLoginXpub);
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed (packaged)");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
             Thread.sleep(2000);
@@ -1003,7 +945,7 @@ class KeyMasterAvatarTest {
             assertEquals(0, result.getExitCode(),
                     "ssh-add should list keys (packaged). stderr: " + result.getStderr());
         } finally {
-            runKmCli("detach");
+            detachViaController();
             Thread.sleep(500);
         }
     }
@@ -1019,13 +961,12 @@ class KeyMasterAvatarTest {
         Path descriptorFile = writeDescriptor("descriptor-pkg-gpg.json", "gpg",
                 avatarPackagedLoginXpub);
 
-        int attachExit = runKmCli("attach", descriptorFile.toString(),
-                "--identity", "alice@atlanta.com", "--policy", "auto");
-        assertEquals(0, attachExit, "km-cli attach should succeed (packaged GPG)");
+        attachViaController(descriptorFile.toString(), "alice@atlanta.com", "auto");
 
         try {
-            // Wait for km-gpg-sa to complete GPG setup (LEARN, import, ownertrust, stubs)
-            Thread.sleep(8000);
+            // Wait for km-gpg-sa to complete GPG setup (LEARN, import, ownertrust, stubs).
+            // Same timing as gpgSignAndVerify — direct attach is ~3s faster than subprocess.
+            Thread.sleep(12000);
 
             // Sign a test message
             avatarPackaged.execInContainer("bash", "-c", "echo 'packaged test' > /tmp/test-pkg.txt");
@@ -1049,7 +990,7 @@ class KeyMasterAvatarTest {
             assertEquals(0, verifyResult.getExitCode(),
                     "GPG verify should succeed (packaged). stderr: " + verifyResult.getStderr());
         } finally {
-            runKmCli("detach");
+            detachViaController();
             Thread.sleep(500);
         }
     }
@@ -1077,38 +1018,21 @@ class KeyMasterAvatarTest {
     }
 
     /**
-     * Run km-cli as a subprocess pointing at our test daemon socket.
+     * Attach to an avatar via direct controller call.
      */
-    private static int runKmCli(String... args) throws Exception {
-        String[] cmd = new String[args.length + 3];
-        cmd[0] = "java";
-        cmd[1] = "-jar";
-        cmd[2] = KM_CLI_JAR;
-        System.arraycopy(args, 0, cmd, 3, args.length);
+    private static void attachViaController(String descriptorPath,
+            String identity, String policy) {
+        JsonObject params = new JsonObject();
+        params.addProperty("descriptor", descriptorPath);
+        params.addProperty("identity", identity);
+        if (policy != null) params.addProperty("policy", policy);
+        JsonObject result = daemonController.handle("session.attach", params);
+        assertFalse(result.has("error"),
+                "session.attach failed: " + result);
+    }
 
-        ProcessBuilder pb = new ProcessBuilder(cmd);
-        pb.environment().put("KM_SOCKET", socketPath.toString());
-        pb.redirectErrorStream(true);
-        Process proc = pb.start();
-
-        // Read output with timeout — process should complete quickly for RPC calls
-        boolean finished = proc.waitFor(60, TimeUnit.SECONDS);
-        if (!finished) {
-            log.warn("km-cli {} did not finish within 60s, killing", args.length > 0 ? args[0] : "");
-            proc.destroyForcibly();
-            fail("km-cli timed out after 60s");
-        }
-
-        // Read remaining output after process has exited
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                log.info("[km-cli] {}", line);
-            }
-        }
-
-        return proc.exitValue();
+    private static void detachViaController() {
+        daemonController.handle("session.detach", new JsonObject());
     }
 
     /**
@@ -1141,24 +1065,10 @@ class KeyMasterAvatarTest {
     }
 
     /**
-     * Wait for a Unix domain socket file to appear.
-     */
-    private static void waitForSocket(Path socket, int maxSeconds) throws Exception {
-        for (int i = 0; i < maxSeconds * 10; i++) {
-            if (Files.exists(socket)) {
-                return;
-            }
-            Thread.sleep(100);
-        }
-        throw new IllegalStateException("Socket " + socket + " did not appear within " + maxSeconds + "s");
-    }
-
-    /**
      * Create a KeyVault in-process (for SSH authorized_keys derivation only).
      */
     private static KeyVault createVaultInProcess() {
-        FileSeedStore store = new FileSeedStore(kvHome);
-        return new Bip32KeyVault(store.getMnemonic(), store.getPassphrase());
+        return new Bip32KeyVault(TEST_MNEMONIC, "");
     }
 
     @AfterAll
@@ -1169,23 +1079,15 @@ class KeyMasterAvatarTest {
         if (relay != null) relay.stop();
         if (network != null) network.close();
 
-        if (daemonProcess != null && daemonProcess.isAlive()) {
-            daemonProcess.destroy();
-            try {
-                daemonProcess.waitFor(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                daemonProcess.destroyForcibly();
-            }
-        }
+        if (daemonController != null) daemonController.handle("session.detach", new JsonObject());
+        if (daemonServer != null) daemonServer.stop();
+    }
 
-        // Dump daemon log for post-mortem debugging
-        if (daemonLogFile != null) {
-            try {
-                String daemonLog = Files.readString(daemonLogFile);
-                log.info("=== km-daemon log ===\n{}", daemonLog);
-            } catch (Exception e) {
-                // ignore
-            }
-        }
+    private static class StubSeedStore implements SeedStore {
+        @Override public boolean exists() { return true; }
+        @Override public void store(String m, String p) {}
+        @Override public String getMnemonic() { return TEST_MNEMONIC; }
+        @Override public String getPassphrase() { return ""; }
+        @Override public void delete() {}
     }
 }

@@ -22,10 +22,12 @@ if [ ! -S /tmp/keymaster-avatar.sock ]; then
     exit 1
 fi
 
-# Start service avatars with auto-restart (like systemd Restart=on-failure)
-(while true; do km-ssh-sa --log-level debug; sleep 1; done) &
-(while true; do km-gpg-sa --log-level debug; sleep 1; done) &
-(while true; do km-nostr-sa --log-level debug; sleep 1; done) &
+# Start service avatars with auto-restart (like systemd Restart=on-failure).
+# "|| true" prevents set -e (inherited by subshell) from killing the loop
+# when an SA exits non-zero (e.g. km-gpg-sa before a session is established).
+(while true; do km-ssh-sa --log-level debug || true; sleep 1; done) &
+(while true; do km-gpg-sa --log-level debug || true; sleep 1; done) &
+(while true; do km-nostr-sa --log-level debug || true; sleep 1; done) &
 
 echo "Avatar PID=$AVATAR_PID, SAs started"
 

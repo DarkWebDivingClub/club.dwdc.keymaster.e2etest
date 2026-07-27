@@ -8,7 +8,7 @@
     <version>0.3.0</version>
 
     <name>club.dwdc.keymaster.e2etest</name>
-    <description>End-to-end tests for KeyMaster — uses Testcontainers to run relay and avatar, km-daemon + km-cli subprocesses.</description>
+    <description>End-to-end tests for KeyMaster — uses Testcontainers to run relay and avatar, embedded km-daemon.</description>
 
     <properties>
         <maven.compiler.source>21</maven.compiler.source>
@@ -34,6 +34,18 @@
         <dependency>
             <groupId>club.dwdc</groupId>
             <artifactId>club.dwdc.keymaster.core</artifactId>
+            <version>${keymaster.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>club.dwdc</groupId>
+            <artifactId>club.dwdc.keymaster.daemon</artifactId>
+            <version>${keymaster.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>club.dwdc</groupId>
+            <artifactId>club.dwdc.keymaster.desktop</artifactId>
             <version>${keymaster.version}</version>
             <scope>test</scope>
         </dependency>
